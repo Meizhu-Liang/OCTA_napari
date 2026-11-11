@@ -5,6 +5,7 @@ import napari
 from pathlib import Path
 from qtpy.QtWidgets import QApplication, QFileDialog
 import re
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", module="pydicom")
 
@@ -52,7 +53,6 @@ SLABS = {
 # =======================================================================
 
 ITEM_TAG = b"\xfe\xff\x00\xe0"      # DICOM item tag (FFFE,E000)
-
 
 def clean_int(value, default=1):
     if value is None or str(value).strip() == "":
@@ -144,12 +144,19 @@ def align_surfaces(surfaces, struct, max_shift=60):
 
 
 def slab_enface(vol, top, bottom, mode="max"):
-    d = np.arange(vol.shape[2], dtype=np.int32)
-    mask = (d >= top[..., None]) & (d < bottom[..., None])
-    data = np.where(mask, vol, 0)
+    """En-face image between two depth surfaces; reads only the voxels inside the slab."""
+    D = vol.shape[2]
+    top = np.clip(top, 0, D - 1)
+    thick = np.clip(bottom - top, 0, None)
+    n = max(int(thick.max()), 1)
+    idx = np.clip(top[..., None] + np.arange(n), 0, D - 1)
+    data = np.take_along_axis(vol, idx, axis=2)
+    valid = np.arange(n) < thick[..., None]
     if mode == "max":
-        return data.max(axis=2).astype(np.float32)
-    return (data.sum(axis=2) / np.maximum(mask.sum(axis=2), 1)).astype(np.float32)
+        return np.where(valid, data, 0).max(axis=2).astype(np.float32)
+    if mode == "mean_reliable":
+        valid = valid & (data > 0)
+    return (np.where(valid, data, 0).sum(axis=2) / np.maximum(valid.sum(axis=2), 1)).astype(np.float32)
 
 
 def normalise(img):
@@ -161,21 +168,40 @@ def contrast(img):
     return float(lo), float(hi)
 
 
-def best_position(frame, cubes, step=4):
-    """Find the best-matching slice: (r, cube name, axis, index, flipped)."""
+_MATCH_CACHE = {}
+
+
+def _slice_table(cube, axis, step_l, step_d):
+    """All slices of one direction, subsampled and normalised; computed once per cube."""
+    key = (id(cube), axis, step_l, step_d)
+    if key not in _MATCH_CACHE:
+        if axis == 0:                                        # fast-axis slices: cube[k]
+            t = cube[:, ::step_l, ::step_d]
+        else:                                                # slow-axis slices: cube[:, k]
+            t = cube[::step_l, :, ::step_d].transpose(1, 0, 2)
+        t = t.reshape(t.shape[0], -1).astype(np.float32)
+        t -= t.mean(axis=1, keepdims=True)
+        t /= t.std(axis=1, keepdims=True) + 1e-6
+        _MATCH_CACHE[key] = t
+    return _MATCH_CACHE[key]
+
+
+def best_position(frame, cubes, step_l=2, step_d=8):
+    """Best-matching slice: (r, cube name, axis, index, flipped)."""
     best = (-1.0, None, 0, 0, False)
     for flipped in (False, True):
         fr = frame[::-1] if flipped else frame
-        f = fr[:, ::step].astype(np.float32)
+        f = fr[::step_l, ::step_d].astype(np.float32).ravel()
         f = (f - f.mean()) / (f.std() + 1e-6)
         for cname, cube in cubes.items():
-            sub = cube[:, :, ::step].astype(np.float32)
             for axis in (0, 1):
-                for k in range(sub.shape[axis]):
-                    c = sub[k] if axis == 0 else sub[:, k]
-                    r = float(np.mean(f * (c - c.mean()) / (c.std() + 1e-6)))
-                    if r > best[0]:
-                        best = (r, cname, axis, k, flipped)
+                t = _slice_table(cube, axis, step_l, step_d)
+                if t.shape[1] != f.size:
+                    continue
+                r = t @ f / f.size                           # correlation with every slice at once
+                k = int(np.argmax(r))
+                if r[k] > best[0]:
+                    best = (float(r[k]), cname, axis, k, flipped)
     return best
 
 def neighbour_score(img):
@@ -238,6 +264,7 @@ print(f"Mean {mean_a:.1f} vs {mean_b:.1f} -> structure = "
       f"{files['cubes'][0 if mean_a > mean_b else 1].name[:12]}")
 
 surfaces, orientation = align_surfaces(load_surfaces_raw(files["seg"], struct.shape[:2]), struct)
+
 # Put everything into Zeiss's B-scan order (so it matches the Zeiss display)
 # Flip the cubes into Zeiss's B-scan order, and keep the surfaces as Zeiss stored them
 # Display orientation: flip cubes and surfaces together, so they stay aligned
@@ -247,6 +274,7 @@ if FLIP_UD:
 if FLIP_LR:
     struct, flow = struct[:, ::-1], flow[:, ::-1]
     surfaces = {k: v[:, ::-1] for k, v in surfaces.items()}
+print("Applied flips -> FLIP_UD:", FLIP_UD, "| FLIP_LR:", FLIP_LR)
 struct, flow = np.ascontiguousarray(struct), np.ascontiguousarray(flow)
 surfaces = {k: np.ascontiguousarray(v) for k, v in surfaces.items()}
 print("Surfaces:", list(surfaces), "| orientation:", orientation)
@@ -316,10 +344,13 @@ flow_masked = np.where(struct > thr_depth[None, None, :], flow, 0)
 reliable = s_crop > thr_depth[top:bottom][None, None, :]
 
 
-def slab_volume(top_name, bot_name, off_b=0):
+def slab_volume(top_name, bot_name, off_b=0, use_noise_mask=True):
     """Flow inside one slab only (zero elsewhere)."""
+    d = np.arange(f_crop.shape[2], dtype=np.int32)              # depth indices of the cropped volume
     mask = (d >= surf[top_name][..., None]) & (d < (surf[bot_name] + off_b)[..., None])
-    return np.where(mask & reliable, f_crop, 0).astype(np.uint8)
+    if use_noise_mask:
+        mask &= reliable
+    return np.where(mask, f_crop, 0).astype(np.uint8)
 
 
 vessel_layers = {
@@ -487,20 +518,20 @@ viewer.reset_view()
 # redraw()
 
 # ======================= 6. En-face images with matplotlib ===============
-import matplotlib.pyplot as plt
-
-
-def show_grid(images, title, ncols=4,  extent = None):
-    """Plot a dict of 2D images in a grid; extent in mm (None = pixels)."""
-    extent = (0, SCAN_MM[1], SCAN_MM[0], 0) if extent is None else extent
+def show_grid(images, title, ncols=4, extent=None):
+    """Plot a dict of 2D images in a grid.
+    extent=None -> axes in mm from SCAN_MM; extent=False -> axes in pixels."""
     if not images:
         return
+    if extent is None:
+        extent = (0, SCAN_MM[1], SCAN_MM[0], 0)
     n = len(images)
     nrows = int(np.ceil(n / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
     for ax, (name, img) in zip(axes.ravel(), images.items()):
         lo, hi = contrast(img)
-        ax.imshow(img, cmap="gray", vmin=lo, vmax=hi, extent=extent,
+        ax.imshow(img, cmap="gray", vmin=lo, vmax=hi,
+                  extent=None if extent is False else extent,
                   interpolation="bicubic")
         ax.set_title(name, fontsize=9)
         ax.axis("off")
@@ -511,7 +542,16 @@ def show_grid(images, title, ncols=4,  extent = None):
 
 
 # Reference images: Zeiss en-face and fundus
-zeiss = {f"Zeiss en-face ({f.name[:6]})": load_2d(f).astype(np.float32) for f in files["enface"]}
+zeiss = {}
+for f in files["enface"]:
+    img = load_2d(f).astype(np.float32)
+    img = ORIENTATIONS[orientation](img)   # same Zeiss-to-cube correction as the surfaces
+    if FLIP_UD:
+        img = np.flipud(img)
+    if FLIP_LR:
+        img = np.fliplr(img)
+    zeiss[f"Zeiss en-face ({f.name[:6]})"] = img
+
 fundus = {f"Fundus {img.shape[0]}x{img.shape[1]}": img
           for img in (load_2d(f) for f in files["fundus"])}
 
@@ -521,7 +561,7 @@ show_grid({f"OCTA (PAR): {k}": v for k, v in octa_par.items()},
           f"OCTA slabs after projection removal (strength {PAR_STRENGTH})")
 show_grid({f"Structure: {k}": v for k, v in struct_slabs.items()},
           "Structural en-face slabs")
-show_grid(fundus, "Fundus images", ncols=2, extent=None)
+show_grid(fundus, "Fundus images", ncols=2, extent=False)
 
 # ---- Single B-scans next to the matching cube slices ----
 bscan_rows = []
@@ -564,10 +604,11 @@ if bscan_rows:
                   (s, f"Cube structure\n({info})"),
                   (fl, "Cube flow (same slice)")]
         for ax, (img, title) in zip(row, panels):
-            img = img[:, top:bottom].T.astype(np.float32)     # depth vertical
+            img = img[:, top:bottom].T.astype(np.float32)        # depth vertical
+            width_mm = img.shape[1] * SCALE_UM[1] / 1000         # A-scans x spacing
             lo, hi = contrast(img)
             ax.imshow(img, cmap="gray", vmin=lo, vmax=hi, aspect="auto",
-                      extent=[0, 3, depth_mm, 0], interpolation="bicubic")
+                      extent=[0, width_mm, depth_mm, 0], interpolation="bicubic")
             ax.set_title(title, fontsize=9)
             ax.set_xlabel("mm")
         row[0].set_ylabel("depth (mm)")
