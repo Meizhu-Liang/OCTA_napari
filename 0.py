@@ -517,6 +517,31 @@ viewer.reset_view()
 # viewer.window.add_dock_widget(canvas_xz, area="bottom", name="XZ")
 # redraw()
 
+ref = viewer.layers["Structure"]
+nB = ref.data.shape[0]
+centre = tuple(s / 2 for s in ref.data.shape)
+
+plane_layer = viewer.add_image(
+    ref.data, name="B-scan plane (3D)", colormap="gray", scale=ref.scale,
+    contrast_limits=ref.contrast_limits, blending="translucent",
+    depiction="plane",
+    plane={"position": (nB // 2, centre[1], centre[2]),
+           "normal": (1, 0, 0),           # plane perpendicular to the B-scan axis
+           "thickness": 1},
+)
+
+
+def _dims_to_plane(event=None):
+    """Move the 3D plane to the B-scan selected with napari's own slider."""
+    b = int(np.clip(round(ref.world_to_data(viewer.dims.point)[0]), 0, nB - 1))
+    pos = list(plane_layer.plane.position)
+    if int(pos[0]) != b:
+        pos[0] = b
+        plane_layer.plane.position = tuple(pos)
+
+
+viewer.dims.events.current_step.connect(_dims_to_plane)
+
 # ======================= 6. En-face images with matplotlib ===============
 def show_grid(images, title, ncols=4, extent=None):
     """Plot a dict of 2D images in a grid.
